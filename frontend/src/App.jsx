@@ -2,6 +2,7 @@ import React, { createContext, useContext } from 'react'
 import { BrowserRouter, Routes, Route, Link, useLocation } from 'react-router-dom'
 import StatusPage from './pages/StatusPage.jsx'
 import AdminPage from './pages/AdminPage.jsx'
+import TopologyPage from './pages/TopologyPage.jsx'
 import useMonitorData from './hooks/useMonitorData'
 
 const AppContext = createContext(null)
@@ -52,6 +53,7 @@ function Header() {
         <h1 style={{ fontSize: 20, fontWeight: 700 }}>服务健康监控</h1>
         <nav style={{ marginLeft: 32 }}>
           {navLink('/', '状态总览')}
+          {navLink('/topology', '依赖拓扑')}
           {navLink('/admin', '管理配置')}
         </nav>
       </div>
@@ -69,9 +71,10 @@ export default function App() {
     <AppContext.Provider value={data}>
       <BrowserRouter>
         <Header />
-        <main style={{ padding: '24px 32px', maxWidth: 1600, margin: '0 auto' }}>
+        <main style={{ padding: '24px 32px', maxWidth: '100%', margin: '0 auto' }}>
           <Routes>
             <Route path="/" element={<StatusPage />} />
+            <Route path="/topology" element={<TopologyPage />} />
             <Route path="/admin" element={<AdminPage />} />
           </Routes>
         </main>

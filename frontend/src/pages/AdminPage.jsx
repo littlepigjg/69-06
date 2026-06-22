@@ -285,11 +285,191 @@ function useToast() {
   return { toast, show }
 }
 
+function DependencyForm({ services, dependencies, onSubmit, onCancel, initial }) {
+  const [form, setForm] = useState({
+    upstream_id: initial?.upstream_id || '',
+    downstream_id: initial?.downstream_id || '',
+    description: initial?.description || ''
+  })
+  const [errors, setErrors] = useState({})
+  const [checking, setChecking] = useState(false)
+
+  const set = (k, v) => {
+    setForm(f => ({ ...f, [k]: v }))
+    if (errors[k]) setErrors(e => { const n = { ...e }; delete n[k]; return n })
+  }
+
+  const validate = () => {
+    const e = {}
+    if (!form.upstream_id) e.upstream_id = '请选择上游服务'
+    if (!form.downstream_id) e.downstream_id = '请选择下游服务'
+    if (form.upstream_id && form.downstream_id && form.upstream_id === form.downstream_id) {
+      e.downstream_id = '不能依赖自身'
+    }
+    setErrors(e)
+    return Object.keys(e).length === 0
+  }
+
+  const submit = async (ev) => {
+    ev.preventDefault()
+    if (!validate()) return
+    setChecking(true)
+    try {
+      await onSubmit({
+        upstream_id: parseInt(form.upstream_id, 10),
+        downstream_id: parseInt(form.downstream_id, 10),
+        description: form.description
+      })
+    } finally {
+      setChecking(false)
+    }
+  }
+
+  return (
+    <form onSubmit={submit}>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr auto 1fr', gap: 12, alignItems: 'end', marginBottom: 16 }}>
+        <FormField label="上游服务" error={errors.upstream_id}>
+          <SelectInput
+            value={form.upstream_id}
+            onChange={v => set('upstream_id', v)}
+            placeholder="选择上游服务"
+            options={services.map(s => ({ value: String(s.id), label: s.name }))}
+          />
+        </FormField>
+        <div style={{ fontSize: 24, color: '#6366f1', fontWeight: 700, paddingBottom: 20, textAlign: 'center' }}>
+          →
+        </div>
+        <FormField label="下游服务（被依赖）" error={errors.downstream_id}>
+          <SelectInput
+            value={form.downstream_id}
+            onChange={v => set('downstream_id', v)}
+            placeholder="选择下游服务"
+            options={services.map(s => ({ value: String(s.id), label: s.name }))}
+          />
+        </FormField>
+      </div>
+      <FormField label="依赖描述（可选）" help="如：数据同步、API调用、消息队列">
+        <TextInput
+          value={form.description}
+          onChange={v => set('description', v)}
+          placeholder="简要描述依赖关系类型"
+        />
+      </FormField>
+      <div style={{ fontSize: 11, color: '#6b7280', marginBottom: 16, padding: 10, background: '#f9fafb', borderRadius: 8 }}>
+        💡 系统会自动检测循环依赖，保存前请确保依赖关系合理
+      </div>
+      <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+        <Button onClick={onCancel}>取消</Button>
+        <Button variant="primary" type="submit" disabled={checking}>
+          {checking ? '检测中...' : initial ? '保存修改' : '添加依赖'}
+        </Button>
+      </div>
+    </form>
+  )
+}
+
+function BatchImportForm({ services, onSubmit, onCancel }) {
+  const [text, setText] = useState('')
+  const [mode, setMode] = useState('merge')
+  const [errors, setErrors] = useState({})
+  const [parsing, setParsing] = useState(false)
+
+  const sampleData = [
+    { upstream_id: 1, downstream_id: 2, description: 'API调用' },
+    { upstream_id: 2, downstream_id: 3, description: '数据库依赖' }
+  ]
+
+  const parseContent = (content) => {
+    const trimmed = content.trim()
+    if (!trimmed) return []
+    try {
+      const parsed = JSON.parse(trimmed)
+      if (Array.isArray(parsed)) return parsed
+      if (parsed.items && Array.isArray(parsed.items)) return parsed.items
+      throw new Error('格式错误')
+    } catch (e) {
+      const lines = trimmed.split('\n').filter(l => l.trim())
+      return lines.map(line => {
+        const parts = line.split(/[,;\t]/).map(p => p.trim())
+        const obj = {}
+        if (parts[0]) obj.upstream_id = isNaN(Number(parts[0])) ? null : Number(parts[0])
+        if (parts[1]) obj.downstream_id = isNaN(Number(parts[1])) ? null : Number(parts[1])
+        if (parts[2]) obj.description = parts[2]
+        return obj
+      })
+    }
+  }
+
+  const submit = async (ev) => {
+    ev.preventDefault()
+    if (!text.trim()) {
+      setErrors({ text: '请输入要导入的数据' })
+      return
+    }
+    setParsing(true)
+    try {
+      const items = parseContent(text)
+      await onSubmit({ items, mode })
+    } catch (e) {
+      setErrors({ text: e.message || '解析失败' })
+    } finally {
+      setParsing(false)
+    }
+  }
+
+  const loadSample = () => {
+    setText(JSON.stringify(sampleData, null, 2))
+  }
+
+  return (
+    <form onSubmit={submit}>
+      <div style={{ marginBottom: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <span style={{ fontSize: 12, color: '#6b7280', alignSelf: 'center' }}>导入模式：</span>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, cursor: 'pointer' }}>
+          <input type="radio" checked={mode === 'merge'} onChange={() => setMode('merge')} />
+          合并（保留现有）
+        </label>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, cursor: 'pointer' }}>
+          <input type="radio" checked={mode === 'replace'} onChange={() => setMode('replace')} />
+          替换（清空后导入）
+        </label>
+      </div>
+      <FormField
+        label="依赖数据"
+        error={errors.text}
+        help="支持 JSON 数组或 CSV（upstream_id, downstream_id, description）格式，每行一条"
+      >
+        <textarea
+          value={text}
+          onChange={e => { setText(e.target.value); if (errors.text) setErrors({}) }}
+          placeholder={`示例（JSON）:\n${JSON.stringify(sampleData, null, 2)}\n\n或 CSV:\n1,2,API调用\n2,3,数据库依赖`}
+          style={{
+            width: '100%', minHeight: 200, padding: 12, borderRadius: 8,
+            border: '1px solid #d1d5db', fontSize: 13, fontFamily: 'monospace',
+            outline: 'none', resize: 'vertical'
+          }}
+        />
+      </FormField>
+      <div style={{ display: 'flex', gap: 10, justifyContent: 'space-between', marginTop: 8 }}>
+        <Button onClick={loadSample} size="sm">加载示例</Button>
+        <div style={{ display: 'flex', gap: 10 }}>
+          <Button onClick={onCancel}>取消</Button>
+          <Button variant="primary" type="submit" disabled={parsing}>
+            {parsing ? '导入中...' : '开始导入'}
+          </Button>
+        </div>
+      </div>
+    </form>
+  )
+}
+
 export default function AdminPage() {
-  const { services, fetchServices, maintenance, fetchMaintenance } = useApp()
+  const { services, fetchServices, maintenance, fetchMaintenance, dependencies, fetchDependencies, fetchTopologyStats, topologyStats } = useApp()
   const [tab, setTab] = useState('services')
   const [showServiceForm, setShowServiceForm] = useState(null)
   const [showMaintForm, setShowMaintForm] = useState(null)
+  const [showDepForm, setShowDepForm] = useState(null)
+  const [showBatchImport, setShowBatchImport] = useState(false)
   const [openMaintenanceMenu, setOpenMaintenanceMenu] = useState(null)
   const { get, post, put, del } = useApi('/api')
   const { toast, show: showToast } = useToast()
@@ -396,6 +576,66 @@ export default function AdminPage() {
     }
   }
 
+  const handleCreateDependency = async (data) => {
+    try {
+      await post('/topology/dependencies', data)
+      await fetchDependencies()
+      await fetchTopologyStats()
+      setShowDepForm(null)
+      showToast('依赖关系已添加')
+    } catch (e) {
+      if (e.message?.includes('cycle') || e.message?.includes('循环')) {
+        showToast('创建失败：会产生循环依赖', 'error')
+      } else {
+        showToast(e.message || '创建失败', 'error')
+      }
+    }
+  }
+
+  const handleDeleteDependency = async (dep) => {
+    const upSvc = services.find(s => s.id === dep.upstream_id)
+    const downSvc = services.find(s => s.id === dep.downstream_id)
+    if (!window.confirm(`确定删除依赖关系「${upSvc?.name || dep.upstream_id} → ${downSvc?.name || dep.downstream_id}」？`)) return
+    try {
+      await del(`/topology/dependencies/${dep.id}`)
+      await fetchDependencies()
+      await fetchTopologyStats()
+      showToast('依赖关系已删除')
+    } catch (e) {
+      showToast(e.message || '删除失败', 'error')
+    }
+  }
+
+  const handleBatchImport = async ({ items, mode }) => {
+    try {
+      const result = await post('/topology/dependencies/batch', { items, mode })
+      await fetchDependencies()
+      await fetchTopologyStats()
+      setShowBatchImport(false)
+      let msg = `成功导入 ${result.imported} 条`
+      if (result.skipped?.length > 0) {
+        msg += `，跳过 ${result.skipped.length} 条`
+        const cycleSkips = result.skipped.filter(s => s.reason === 'would_create_cycle').length
+        if (cycleSkips > 0) msg += `（${cycleSkips} 条因循环依赖被跳过）`
+      }
+      showToast(msg)
+    } catch (e) {
+      showToast(e.message || '导入失败', 'error')
+    }
+  }
+
+  const handleClearAllDependencies = async () => {
+    if (!window.confirm('确定清空所有依赖关系？此操作不可恢复。')) return
+    try {
+      await del('/topology/dependencies')
+      await fetchDependencies()
+      await fetchTopologyStats()
+      showToast('已清空所有依赖关系')
+    } catch (e) {
+      showToast(e.message || '操作失败', 'error')
+    }
+  }
+
   const activeMaintenance = useMemo(() => maintenance.filter(m => {
     const now = moment()
     const start = moment(m.start_time)
@@ -422,16 +662,34 @@ export default function AdminPage() {
             管理监控服务端点和维护窗口配置
           </p>
         </div>
-        <Button
-          variant="primary"
-          icon="+"
-          onClick={() => tab === 'services'
-            ? setShowServiceForm({ mode: 'create' })
-            : setShowMaintForm({ mode: 'create' })
-          }
-        >
-          {tab === 'services' ? '添加监控服务' : '创建维护窗口'}
-        </Button>
+        {tab === 'dependencies' ? (
+          <div style={{ display: 'flex', gap: 8 }}>
+            <Button onClick={() => setShowBatchImport(true)} icon="⤴">
+              批量导入
+            </Button>
+            <Button onClick={handleClearAllDependencies} variant="ghost" icon="🗑">
+              清空所有
+            </Button>
+            <Button
+              variant="primary"
+              icon="+"
+              onClick={() => setShowDepForm({ mode: 'create' })}
+            >
+              添加依赖关系
+            </Button>
+          </div>
+        ) : (
+          <Button
+            variant="primary"
+            icon="+"
+            onClick={() => tab === 'services'
+              ? setShowServiceForm({ mode: 'create' })
+              : setShowMaintForm({ mode: 'create' })
+            }
+          >
+            {tab === 'services' ? '添加监控服务' : '创建维护窗口'}
+          </Button>
+        )}
       </div>
 
       {activeMaintenance.length > 0 && (
@@ -468,12 +726,50 @@ export default function AdminPage() {
           onClick={() => setTab('services')}
         />
         <TabButton
+          active={tab === 'dependencies'}
+          label="依赖关系"
+          badge={dependencies.length}
+          onClick={() => setTab('dependencies')}
+        />
+        <TabButton
           active={tab === 'maintenance'}
           label="维护窗口"
           badge={maintenance.length}
           onClick={() => setTab('maintenance')}
         />
       </div>
+
+      {tab === 'dependencies' && topologyStats?.cycles > 0 && (
+        <div style={{
+          margin: '0 0 16px 0', padding: '12px 16px', borderRadius: 10,
+          background: '#fffbeb', border: '1px solid #fcd34d',
+          display: 'flex', alignItems: 'center', gap: 12
+        }}>
+          <span style={{ fontSize: 20 }}>⚠️</span>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 600, color: '#92400e' }}>
+              检测到 {topologyStats.cycles} 个循环依赖
+            </div>
+            <div style={{ fontSize: 12, color: '#b45309', marginTop: 2 }}>
+              循环依赖会导致故障传播分析异常，请尽快修正
+            </div>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            {topologyStats.cyclePaths?.slice(0, 3).map((cycle, i) => (
+              <div key={i} style={{
+                fontSize: 11, color: '#92400e',
+                background: '#fef3c7', padding: '4px 8px', borderRadius: 4,
+                fontFamily: 'monospace'
+              }}>
+                {cycle.map(id => {
+                  const s = services.find(svc => svc.id === id)
+                  return s?.name || `#${id}`
+                }).join(' → ')}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {tab === 'services' && (
         <div>
@@ -715,6 +1011,92 @@ export default function AdminPage() {
         </div>
       )}
 
+      {tab === 'dependencies' && (
+        <div>
+          {dependencies.length === 0 && services.length < 2 && (
+            <EmptyState
+              icon="🔗"
+              title="无法配置依赖关系"
+              hint="请先添加至少 2 个服务，然后再配置它们之间的依赖关系"
+            />
+          )}
+          {dependencies.length === 0 && services.length >= 2 && (
+            <EmptyState
+              icon="🔗"
+              title="还没有配置任何依赖关系"
+              hint="点击右上角「添加依赖关系」按钮，或使用「批量导入」从 CMDB/配置文件同步"
+            />
+          )}
+
+          {dependencies.length > 0 && (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(360px, 1fr))', gap: 12 }}>
+              {dependencies.map(dep => {
+                const upSvc = services.find(s => s.id === dep.upstream_id)
+                const downSvc = services.find(s => s.id === dep.downstream_id)
+                const upStatus = upSvc?.summary?.status
+                const downStatus = downSvc?.summary?.status
+                const statusDot = (s) => ({
+                  up: '#10b981', down: '#ef4444', maintenance: '#f59e0b', unknown: '#9ca3af'
+                }[s] || '#9ca3af')
+
+                return (
+                  <div
+                    key={dep.id}
+                    style={{
+                      background: '#fff', borderRadius: 12, padding: 16,
+                      border: '1px solid #e5e7eb'
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
+                      <div style={{
+                        flex: 1, display: 'flex', alignItems: 'center', gap: 8,
+                        padding: '8px 12px', background: '#f9fafb', borderRadius: 8
+                      }}>
+                        <span style={{
+                          width: 10, height: 10, borderRadius: '50%',
+                          background: statusDot(upStatus)
+                        }} />
+                        <span style={{ fontWeight: 600, fontSize: 13, flex: 1 }}>
+                          {upSvc?.name || `#${dep.upstream_id}`}
+                        </span>
+                      </div>
+                      <span style={{ color: '#6366f1', fontWeight: 700, fontSize: 16 }}>→</span>
+                      <div style={{
+                        flex: 1, display: 'flex', alignItems: 'center', gap: 8,
+                        padding: '8px 12px', background: '#fef3c7', borderRadius: 8
+                      }}>
+                        <span style={{
+                          width: 10, height: 10, borderRadius: '50%',
+                          background: statusDot(downStatus)
+                        }} />
+                        <span style={{ fontWeight: 600, fontSize: 13, flex: 1 }}>
+                          {downSvc?.name || `#${dep.downstream_id}`}
+                        </span>
+                      </div>
+                      <IconButton
+                        icon="✕"
+                        color="danger"
+                        title="删除依赖"
+                        onClick={() => handleDeleteDependency(dep)}
+                      />
+                    </div>
+                    {dep.description && (
+                      <div style={{
+                        fontSize: 12, color: '#6b7280',
+                        padding: '6px 10px', background: '#f9fafb',
+                        borderRadius: 6
+                      }}>
+                        💬 {dep.description}
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
       {showServiceForm && (
         <Modal
           title={showServiceForm.mode === 'create' ? '添加监控服务' : '编辑服务配置'}
@@ -747,6 +1129,36 @@ export default function AdminPage() {
               : (data) => handleUpdateMaint(showMaintForm.data.id, data)
             }
             onCancel={() => setShowMaintForm(null)}
+          />
+        </Modal>
+      )}
+
+      {showDepForm && (
+        <Modal
+          title="添加服务依赖关系"
+          onClose={() => setShowDepForm(null)}
+          width={640}
+        >
+          <DependencyForm
+            initial={showDepForm.data}
+            services={services}
+            dependencies={dependencies}
+            onSubmit={handleCreateDependency}
+            onCancel={() => setShowDepForm(null)}
+          />
+        </Modal>
+      )}
+
+      {showBatchImport && (
+        <Modal
+          title="批量导入依赖关系"
+          onClose={() => setShowBatchImport(false)}
+          width={720}
+        >
+          <BatchImportForm
+            services={services}
+            onSubmit={handleBatchImport}
+            onCancel={() => setShowBatchImport(false)}
           />
         </Modal>
       )}

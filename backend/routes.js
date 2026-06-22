@@ -4,6 +4,7 @@ const storage = require('./storage');
 const status = require('./status');
 const scheduler = require('./scheduler');
 const notifier = require('./notifier');
+const topology = require('./topology');
 
 router.get('/health', (req, res) => {
   res.json({ ok: true, timestamp: new Date().toISOString() });
@@ -252,6 +253,206 @@ router.get('/status/summary', async (req, res) => {
       counts: { up, down, maintenance, unknown },
       services: summaries
     });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.get('/topology/dependencies', async (req, res) => {
+  try {
+    const dependencies = await storage.dependencies.getAll();
+    res.json(dependencies);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.get('/topology/stats', async (req, res) => {
+  try {
+    const dependencies = await storage.dependencies.getAll();
+    const services = await storage.services.getAll();
+    const enriched = [];
+    for (const svc of services) {
+      enriched.push({
+        ...svc,
+        summary: await status.getServiceSummary(svc.id)
+      });
+    }
+    const stats = topology.getTopologyStats(dependencies, enriched);
+    res.json(stats);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.get('/topology/full', async (req, res) => {
+  try {
+    const dependencies = await storage.dependencies.getAll();
+    const services = await storage.services.getAll();
+    const enriched = [];
+    for (const svc of services) {
+      enriched.push({
+        ...svc,
+        summary: await status.getServiceSummary(svc.id)
+      });
+    }
+    const stats = topology.getTopologyStats(dependencies, enriched);
+    res.json({ services: enriched, dependencies, stats });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.post('/topology/dependencies', async (req, res) => {
+  try {
+    const data = req.body || {};
+    const upstreamId = parseInt(data.upstream_id, 10);
+    const downstreamId = parseInt(data.downstream_id, 10);
+    if (!upstreamId || !downstreamId) {
+      return res.status(400).json({ error: 'upstream_id and downstream_id are required' });
+    }
+    if (upstreamId === downstreamId) {
+      return res.status(400).json({ error: 'A service cannot depend on itself', cycle: true });
+    }
+
+    const upSvc = await storage.services.getById(upstreamId);
+    const downSvc = await storage.services.getById(downstreamId);
+    if (!upSvc || !downSvc) {
+      return res.status(404).json({ error: 'Service not found' });
+    }
+
+    const allDeps = await storage.dependencies.getAll();
+    if (topology.wouldCreateCycle(allDeps, upstreamId, downstreamId)) {
+      return res.status(400).json({
+        error: 'This dependency would create a cycle',
+        cycle: true
+      });
+    }
+
+    const created = await storage.dependencies.create({
+      upstream_id: upstreamId,
+      downstream_id: downstreamId,
+      description: data.description || ''
+    });
+    notifier.notifyTopologyChange('dependency_created', created);
+    res.status(201).json(created);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.delete('/topology/dependencies/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const existing = await storage.dependencies.getById(id);
+    if (!existing) return res.status(404).json({ error: 'Dependency not found' });
+    await storage.dependencies.remove(id);
+    notifier.notifyTopologyChange('dependency_deleted', { id });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.delete('/topology/dependencies', async (req, res) => {
+  try {
+    const { upstream_id, downstream_id } = req.query;
+    if (upstream_id && downstream_id) {
+      await storage.dependencies.removeByPair(
+        parseInt(upstream_id, 10),
+        parseInt(downstream_id, 10)
+      );
+      notifier.notifyTopologyChange('dependency_deleted', {
+        upstream_id: parseInt(upstream_id, 10),
+        downstream_id: parseInt(downstream_id, 10)
+      });
+    } else {
+      await storage.dependencies.clearAll();
+      notifier.notifyTopologyChange('dependencies_cleared', {});
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.post('/topology/dependencies/batch', async (req, res) => {
+  try {
+    const { items, mode = 'merge' } = req.body || {};
+    if (!Array.isArray(items)) {
+      return res.status(400).json({ error: 'items must be an array' });
+    }
+
+    const allDeps = await storage.dependencies.getAll();
+    const validItems = [];
+    const skipped = [];
+
+    for (const item of items) {
+      const upId = parseInt(item.upstream_id, 10);
+      const downId = parseInt(item.downstream_id, 10);
+      if (!upId || !downId || upId === downId) {
+        skipped.push({ ...item, reason: 'invalid_ids' });
+        continue;
+      }
+      if (topology.wouldCreateCycle([...allDeps, ...validItems], upId, downId)) {
+        skipped.push({ ...item, reason: 'would_create_cycle' });
+        continue;
+      }
+      validItems.push({
+        upstream_id: upId,
+        downstream_id: downId,
+        description: item.description || ''
+      });
+    }
+
+    if (mode === 'replace') {
+      await storage.dependencies.clearAll();
+    }
+
+    const imported = await storage.dependencies.bulkImport(validItems);
+    notifier.notifyTopologyChange('batch_import', { count: imported.length, mode });
+    res.json({ imported: imported.length, skipped, total: imported.length + skipped.length });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.get('/topology/services/:id/impact', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const svc = await storage.services.getById(id);
+    if (!svc) return res.status(404).json({ error: 'Service not found' });
+
+    const dependencies = await storage.dependencies.getAll();
+    const services = await storage.services.getAll();
+    const enriched = [];
+    for (const s of services) {
+      enriched.push({
+        ...s,
+        summary: await status.getServiceSummary(s.id)
+      });
+    }
+    const analysis = topology.analyzeServiceImpact(dependencies, id, enriched);
+    res.json(analysis);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.get('/topology/cycles', async (req, res) => {
+  try {
+    const dependencies = await storage.dependencies.getAll();
+    const cycles = topology.detectCycles(dependencies);
+    res.json({ hasCycles: cycles.length > 0, cycles });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });

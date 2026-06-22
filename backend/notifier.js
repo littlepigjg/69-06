@@ -80,11 +80,21 @@ function notifyServiceUpdate(serviceId, service) {
   });
 }
 
+function notifyTopologyChange(action, data) {
+  broadcast({
+    type: 'topology_change',
+    action,
+    data,
+    timestamp: new Date().toISOString()
+  });
+}
+
 module.exports = {
   init,
   broadcast,
   notifyStatusChange,
   notifyNewCheck,
   notifyMaintenanceChange,
-  notifyServiceUpdate
+  notifyServiceUpdate,
+  notifyTopologyChange
 };

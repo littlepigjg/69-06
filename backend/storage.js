@@ -91,9 +91,23 @@ async function initDB() {
   `);
   dirty = true;
 
+  db.run(`
+    CREATE TABLE IF NOT EXISTS service_dependencies (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      upstream_id INTEGER NOT NULL,
+      downstream_id INTEGER NOT NULL,
+      description TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(upstream_id, downstream_id)
+    )
+  `);
+  dirty = true;
+
   try {
     db.exec('CREATE INDEX IF NOT EXISTS idx_results_service_time ON check_results(service_id, timestamp)');
     db.exec('CREATE INDEX IF NOT EXISTS idx_maintenance_time ON maintenance_windows(start_time, end_time)');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_deps_upstream ON service_dependencies(upstream_id)');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_deps_downstream ON service_dependencies(downstream_id)');
     dirty = true;
   } catch (e) {}
 
@@ -181,6 +195,65 @@ const services = {
     run('DELETE FROM services WHERE id = ?', [id]);
     run('DELETE FROM check_results WHERE service_id = ?', [id]);
     run('DELETE FROM maintenance_windows WHERE service_id = ?', [id]);
+    run('DELETE FROM service_dependencies WHERE upstream_id = ? OR downstream_id = ?', [id, id]);
+    saveDB();
+    return { changes: 1 };
+  }
+};
+
+const dependencies = {
+  getAll: async () => query('SELECT * FROM service_dependencies ORDER BY id'),
+  getByUpstream: async (upstreamId) =>
+    query('SELECT * FROM service_dependencies WHERE upstream_id = ?', [upstreamId]),
+  getByDownstream: async (downstreamId) =>
+    query('SELECT * FROM service_dependencies WHERE downstream_id = ?', [downstreamId]),
+  getById: async (id) => queryOne('SELECT * FROM service_dependencies WHERE id = ?', [id]),
+  create: async (data) => {
+    const res = run(
+      `INSERT OR IGNORE INTO service_dependencies (upstream_id, downstream_id, description)
+       VALUES (?, ?, ?)`,
+      [data.upstream_id, data.downstream_id, data.description || '']
+    );
+    saveDB();
+    if (res.lastID) {
+      return queryOne('SELECT * FROM service_dependencies WHERE id = ?', [res.lastID]);
+    }
+    return queryOne(
+      'SELECT * FROM service_dependencies WHERE upstream_id = ? AND downstream_id = ?',
+      [data.upstream_id, data.downstream_id]
+    );
+  },
+  update: async (id, data) => {
+    const keys = Object.keys(data);
+    if (keys.length === 0) return queryOne('SELECT * FROM service_dependencies WHERE id = ?', [id]);
+    const sets = keys.map(k => `${k} = ?`).join(', ');
+    const values = keys.map(k => data[k]);
+    run(`UPDATE service_dependencies SET ${sets} WHERE id = ?`, [...values, id]);
+    saveDB();
+    return queryOne('SELECT * FROM service_dependencies WHERE id = ?', [id]);
+  },
+  remove: async (id) => {
+    run('DELETE FROM service_dependencies WHERE id = ?', [id]);
+    saveDB();
+    return { changes: 1 };
+  },
+  removeByPair: async (upstreamId, downstreamId) => {
+    run('DELETE FROM service_dependencies WHERE upstream_id = ? AND downstream_id = ?', [upstreamId, downstreamId]);
+    saveDB();
+    return { changes: 1 };
+  },
+  bulkImport: async (items) => {
+    const results = [];
+    for (const item of items) {
+      if (!item.upstream_id || !item.downstream_id) continue;
+      if (item.upstream_id === item.downstream_id) continue;
+      const created = await dependencies.create(item);
+      if (created) results.push(created);
+    }
+    return results;
+  },
+  clearAll: async () => {
+    run('DELETE FROM service_dependencies');
     saveDB();
     return { changes: 1 };
   }
@@ -248,5 +321,6 @@ module.exports = {
   cleanupOldData,
   services,
   checkResults,
-  maintenance
+  maintenance,
+  dependencies
 };
