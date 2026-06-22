@@ -1,18 +1,9 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react'
-import { ForceLayout, getAffectedServices, getDirectDownstream, getDirectUpstream } from '../lib/topology'
-
-const STATUS_COLORS = {
-  up: '#10b981',
-  down: '#ef4444',
-  maintenance: '#f59e0b',
-  unknown: '#9ca3af'
-}
-
-const TYPE_ICONS = {
-  http: '🌐',
-  https: '🔒',
-  tcp: '🔌'
-}
+import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react'
+import useForceLayout from '../hooks/useForceLayout'
+import TopologyControls from './TopologyControls'
+import TopologyLegend from './TopologyLegend'
+import { getAffectedServices } from '../lib/topology'
+import { lightenColor, darkenColor, STATUS_COLORS, TYPE_ICONS } from '../utils/graphColors'
 
 export default function TopologyGraph({
   services,
@@ -20,25 +11,29 @@ export default function TopologyGraph({
   selectedNodeId,
   onSelectNode,
   onEdgeClick,
-  highlightFailed = true
+  highlightFailed = true,
+  storageKey = 'topology_positions'
 }) {
-  const canvasRef = useRef(null)
   const containerRef = useRef(null)
-  const layoutRef = useRef(null)
+  const canvasRef = useRef(null)
   const transformRef = useRef({ x: 0, y: 0, scale: 1 })
+  const [size, setSize] = useState({ width: 0, height: 0 })
   const [hoveredNode, setHoveredNode] = useState(null)
   const [hoveredEdge, setHoveredEdge] = useState(null)
   const [tooltip, setTooltip] = useState(null)
   const draggingRef = useRef(null)
   const panningRef = useRef(null)
+  const renderTickRef = useRef(0)
 
-  const failedIds = services
-    .filter(s => s.summary?.status === 'down')
-    .map(s => s.id)
+  const failedIds = useMemo(() =>
+    services.filter(s => s.summary?.status === 'down').map(s => s.id),
+    [services]
+  )
 
-  const impact = highlightFailed && failedIds.length > 0
-    ? getAffectedServices(dependencies, failedIds)
-    : null
+  const impact = useMemo(() => {
+    if (!highlightFailed || failedIds.length === 0) return null
+    return getAffectedServices(dependencies, failedIds)
+  }, [dependencies, failedIds, highlightFailed])
 
   const getNodeColor = useCallback((node) => {
     const status = node.service?.summary?.status || 'unknown'
@@ -51,201 +46,129 @@ export default function TopologyGraph({
     return STATUS_COLORS[status] || STATUS_COLORS.unknown
   }, [impact])
 
+  const canvasToWorld = useCallback((sx, sy) => {
+    const { x: tx, y: ty, scale } = transformRef.current
+    return { x: (sx - tx) / scale, y: (sy - ty) / scale }
+  }, [])
+
+  const {
+    layout,
+    nodes,
+    edges,
+    fixNode,
+    getNodeAt,
+    getEdgeAt,
+    reset,
+    scheduleSave
+  } = useForceLayout({
+    services,
+    dependencies,
+    width: size.width,
+    height: size.height,
+    storageKey,
+    onTick: () => {
+      renderTickRef.current += 1
+    }
+  })
+
   const render = useCallback(() => {
     const canvas = canvasRef.current
-    if (!canvas || !layoutRef.current) return
+    if (!canvas || !layout) return
     const ctx = canvas.getContext('2d')
     const dpr = window.devicePixelRatio || 1
-    const { width, height } = canvas.getBoundingClientRect()
-    canvas.width = width * dpr
-    canvas.height = height * dpr
-    ctx.scale(dpr, dpr)
+    const rect = canvas.getBoundingClientRect()
 
-    ctx.clearRect(0, 0, width, height)
+    if (canvas.width !== rect.width * dpr || canvas.height !== rect.height * dpr) {
+      canvas.width = rect.width * dpr
+      canvas.height = rect.height * dpr
+    }
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+    ctx.clearRect(0, 0, rect.width, rect.height)
 
     const { x: tx, y: ty, scale } = transformRef.current
     ctx.save()
     ctx.translate(tx, ty)
     ctx.scale(scale, scale)
 
-    for (const edge of layoutRef.current.edges) {
-      const source = layoutRef.current.nodes.get(edge.source)
-      const target = layoutRef.current.nodes.get(edge.target)
+    for (const edge of edges) {
+      const source = nodes.get(edge.source)
+      const target = nodes.get(edge.target)
       if (!source || !target) continue
 
-      const isHighlightedEdge = selectedNodeId !== null &&
+      const isHighlighted = selectedNodeId !== null &&
         (edge.source === selectedNodeId || edge.target === selectedNodeId)
       const isHovered = hoveredEdge?.id === edge.id
 
-      ctx.save()
-      ctx.strokeStyle = isHovered ? '#6366f1' : isHighlightedEdge ? '#818cf8' : '#cbd5e1'
-      ctx.lineWidth = isHovered ? 3 : isHighlightedEdge ? 2.5 : 1.5
-
-      const dx = target.x - source.x
-      const dy = target.y - source.y
-      const dist = Math.sqrt(dx * dx + dy * dy) || 1
-      const ux = dx / dist
-      const uy = dy / dist
-
-      const sx = source.x + ux * source.radius
-      const sy = source.y + uy * source.radius
-      const ex = target.x - ux * (target.radius + 10)
-      const ey = target.y - uy * (target.radius + 10)
-
-      ctx.beginPath()
-      ctx.moveTo(sx, sy)
-      ctx.lineTo(ex, ey)
-      ctx.stroke()
-
-      const arrowSize = isHovered ? 12 : 8
-      const ahx = ux * arrowSize
-      const ahy = uy * arrowSize
-      const apx = -uy * arrowSize * 0.5
-      const apy = ux * arrowSize * 0.5
-
-      ctx.fillStyle = ctx.strokeStyle
-      ctx.beginPath()
-      ctx.moveTo(ex, ey)
-      ctx.lineTo(ex - ahx + apx, ey - ahy + apy)
-      ctx.lineTo(ex - ahx - apx, ey - ahy - apy)
-      ctx.closePath()
-      ctx.fill()
-      ctx.restore()
+      drawEdge(ctx, source, target, { isHighlighted, isHovered })
     }
 
-    for (const node of layoutRef.current.nodes.values()) {
-      const status = node.service?.summary?.status || 'unknown'
+    for (const node of nodes.values()) {
+      const color = getNodeColor(node)
       const isSelected = selectedNodeId === node.id
       const isHovered = hoveredNode?.id === node.id
-      const color = getNodeColor(node)
       const id = String(node.id)
       const isFailed = impact?.failed.has(id)
-      const isDirectAffected = impact?.direct.has(id)
-      const isIndirectAffected = impact?.indirect.has(id)
+      const isDirect = impact?.direct.has(id)
+      const isIndirect = impact?.indirect.has(id)
 
-      ctx.save()
-
-      if (isFailed || isDirectAffected || isIndirectAffected) {
-        const pulseRadius = node.radius + (isFailed ? 20 : isDirectAffected ? 15 : 10)
-        const gradient = ctx.createRadialGradient(node.x, node.y, node.radius, node.x, node.y, pulseRadius)
-        gradient.addColorStop(0, isFailed ? 'rgba(239,68,68,0.4)' : isDirectAffected ? 'rgba(249,115,22,0.3)' : 'rgba(251,191,36,0.25)')
-        gradient.addColorStop(1, 'rgba(0,0,0,0)')
-        ctx.fillStyle = gradient
-        ctx.beginPath()
-        ctx.arc(node.x, node.y, pulseRadius, 0, Math.PI * 2)
-        ctx.fill()
-      }
-
-      if (isSelected || isHovered) {
-        ctx.strokeStyle = isSelected ? '#6366f1' : '#94a3b8'
-        ctx.lineWidth = isSelected ? 4 : 2
-        ctx.beginPath()
-        ctx.arc(node.x, node.y, node.radius + (isSelected ? 6 : 3), 0, Math.PI * 2)
-        ctx.stroke()
-      }
-
-      const gradient = ctx.createRadialGradient(
-        node.x - node.radius * 0.3, node.y - node.radius * 0.3, 0,
-        node.x, node.y, node.radius
-      )
-      gradient.addColorStop(0, lightenColor(color, 40))
-      gradient.addColorStop(1, color)
-
-      ctx.fillStyle = gradient
-      ctx.beginPath()
-      ctx.arc(node.x, node.y, node.radius, 0, Math.PI * 2)
-      ctx.fill()
-
-      ctx.strokeStyle = darkenColor(color, 20)
-      ctx.lineWidth = 2
-      ctx.stroke()
-
-      ctx.fillStyle = '#fff'
-      ctx.font = 'bold 20px sans-serif'
-      ctx.textAlign = 'center'
-      ctx.textBaseline = 'middle'
-      const icon = TYPE_ICONS[node.service?.type] || '📦'
-      ctx.fillText(icon, node.x, node.y - 2)
-
-      ctx.fillStyle = '#1f2937'
-      ctx.font = '12px sans-serif'
-      ctx.fontWeight = '600'
-      const name = node.name || `Service ${node.id}`
-      const displayName = name.length > 14 ? name.substring(0, 12) + '...' : name
-      ctx.fillText(displayName, node.x, node.y + node.radius + 16)
-
-      if (status === 'down') {
-        ctx.fillStyle = '#ef4444'
-        ctx.font = 'bold 10px sans-serif'
-        ctx.fillText('故障', node.x, node.y + node.radius + 30)
-      } else if (status === 'maintenance') {
-        ctx.fillStyle = '#f59e0b'
-        ctx.font = 'bold 10px sans-serif'
-        ctx.fillText('维护中', node.x, node.y + node.radius + 30)
-      }
-
-      ctx.restore()
+      drawNode(ctx, node, {
+        color,
+        isSelected,
+        isHovered,
+        isFailed,
+        isDirect,
+        isIndirect
+      })
     }
 
     ctx.restore()
-  }, [selectedNodeId, hoveredNode, hoveredEdge, getNodeColor, impact])
+  }, [layout, nodes, edges, selectedNodeId, hoveredNode, hoveredEdge, getNodeColor, impact])
 
   useEffect(() => {
     const container = containerRef.current
     if (!container) return
 
-    const { width, height } = container.getBoundingClientRect()
-    if (!layoutRef.current) {
-      layoutRef.current = new ForceLayout({ width, height })
-    } else {
-      layoutRef.current.setSize(width, height)
+    const updateSize = () => {
+      const rect = container.getBoundingClientRect()
+      setSize({ width: rect.width, height: rect.height })
     }
 
-    layoutRef.current.setData(services, dependencies)
-    layoutRef.current.stop()
-    layoutRef.current.start(() => render())
-
-    const handleResize = () => {
-      const { width, height } = container.getBoundingClientRect()
-      layoutRef.current?.setSize(width, height)
-      render()
-    }
-    window.addEventListener('resize', handleResize)
-
-    return () => {
-      window.removeEventListener('resize', handleResize)
-      layoutRef.current?.stop()
-    }
-  }, [services, dependencies, render])
+    updateSize()
+    window.addEventListener('resize', updateSize)
+    return () => window.removeEventListener('resize', updateSize)
+  }, [])
 
   useEffect(() => {
-    render()
-    const interval = setInterval(render, 100)
-    return () => clearInterval(interval)
-  }, [render])
-
-  const screenToWorld = useCallback((sx, sy) => {
-    const { x: tx, y: ty, scale } = transformRef.current
-    return {
-      x: (sx - tx) / scale,
-      y: (sy - ty) / scale
+    let running = true
+    const loop = () => {
+      if (!running) return
+      render()
+      requestAnimationFrame(loop)
     }
-  }, [])
+    requestAnimationFrame(loop)
+    return () => { running = false }
+  }, [render])
 
   const handleMouseDown = useCallback((e) => {
     const rect = canvasRef.current.getBoundingClientRect()
     const sx = e.clientX - rect.left
     const sy = e.clientY - rect.top
-    const { x, y } = screenToWorld(sx, sy)
+    const { x, y } = canvasToWorld(sx, sy)
 
-    const node = layoutRef.current?.getNodeAt(x, y)
+    const node = getNodeAt(x, y)
     if (node) {
       draggingRef.current = { nodeId: node.id, startX: sx, startY: sy, moved: false }
-      layoutRef.current.fixNode(node.id, node.x, node.y)
+      fixNode(node.id, node.x, node.y)
     } else {
-      panningRef.current = { startX: sx, startY: sy, origX: transformRef.current.x, origY: transformRef.current.y }
+      panningRef.current = {
+        startX: sx,
+        startY: sy,
+        origX: transformRef.current.x,
+        origY: transformRef.current.y
+      }
     }
-  }, [screenToWorld])
+  }, [canvasToWorld, getNodeAt, fixNode])
 
   const handleMouseMove = useCallback((e) => {
     const rect = canvasRef.current.getBoundingClientRect()
@@ -253,58 +176,51 @@ export default function TopologyGraph({
     const sy = e.clientY - rect.top
 
     if (draggingRef.current) {
-      const { x, y } = screenToWorld(sx, sy)
-      layoutRef.current.fixNode(draggingRef.current.nodeId, x, y)
+      const { x, y } = canvasToWorld(sx, sy)
+      fixNode(draggingRef.current.nodeId, x, y)
       draggingRef.current.moved = true
-      render()
     } else if (panningRef.current) {
       transformRef.current.x = panningRef.current.origX + (sx - panningRef.current.startX)
       transformRef.current.y = panningRef.current.origY + (sy - panningRef.current.startY)
-      render()
     } else {
-      const { x, y } = screenToWorld(sx, sy)
-      const node = layoutRef.current?.getNodeAt(x, y)
-      const edge = node ? null : layoutRef.current?.getEdgeAt(x, y)
+      const { x, y } = canvasToWorld(sx, sy)
+      const node = getNodeAt(x, y)
+      const edge = node ? null : getEdgeAt(x, y)
       setHoveredNode(node)
       setHoveredEdge(edge)
-      if (node) {
-        setTooltip({ x: sx, y: sy, node })
-        canvasRef.current.style.cursor = 'pointer'
-      } else if (edge) {
-        setTooltip({ x: sx, y: sy, edge })
+      if (node || edge) {
+        setTooltip({ x: sx, y: sy, node, edge })
         canvasRef.current.style.cursor = 'pointer'
       } else {
         setTooltip(null)
         canvasRef.current.style.cursor = 'grab'
       }
     }
-  }, [screenToWorld, render])
+  }, [canvasToWorld, fixNode, getNodeAt, getEdgeAt])
 
-  const handleMouseUp = useCallback((e) => {
+  const handleMouseUp = useCallback(() => {
     if (draggingRef.current) {
       if (!draggingRef.current.moved) {
         onSelectNode?.(draggingRef.current.nodeId)
       } else {
-        layoutRef.current.releaseNode(draggingRef.current.nodeId)
-        layoutRef.current.start(() => render())
+        scheduleSave()
       }
       draggingRef.current = null
     } else if (panningRef.current) {
       panningRef.current = null
     }
-  }, [onSelectNode, render])
+  }, [onSelectNode, scheduleSave])
 
   const handleMouseLeave = useCallback(() => {
     setHoveredNode(null)
     setHoveredEdge(null)
     setTooltip(null)
     if (draggingRef.current) {
-      layoutRef.current.releaseNode(draggingRef.current.nodeId)
-      layoutRef.current.start(() => render())
+      scheduleSave()
       draggingRef.current = null
     }
     panningRef.current = null
-  }, [render])
+  }, [scheduleSave])
 
   const handleWheel = useCallback((e) => {
     e.preventDefault()
@@ -322,51 +238,37 @@ export default function TopologyGraph({
       y: sy - (sy - ty) * ratio,
       scale: newScale
     }
-    render()
-  }, [render])
+  }, [])
 
-  const resetView = () => {
+  const zoomIn = useCallback(() => {
+    transformRef.current.scale = Math.min(5, transformRef.current.scale * 1.2)
+  }, [])
+
+  const zoomOut = useCallback(() => {
+    transformRef.current.scale = Math.max(0.2, transformRef.current.scale / 1.2)
+  }, [])
+
+  const resetView = useCallback(() => {
     transformRef.current = { x: 0, y: 0, scale: 1 }
-    render()
-  }
+  }, [])
 
-  const zoomIn = () => {
-    const { width, height } = canvasRef.current.getBoundingClientRect()
-    transformRef.current = {
-      ...transformRef.current,
-      scale: Math.min(5, transformRef.current.scale * 1.2)
-    }
-    render()
-  }
+  const relayout = useCallback(() => {
+    reset()
+  }, [reset])
 
-  const zoomOut = () => {
-    transformRef.current = {
-      ...transformRef.current,
-      scale: Math.max(0.2, transformRef.current.scale / 1.2)
-    }
-    render()
-  }
-
-  const relayout = () => {
-    if (layoutRef.current) {
-      for (const node of layoutRef.current.nodes.values()) {
-        node.x = (layoutRef.current.width / 2) + (Math.random() - 0.5) * 300
-        node.y = (layoutRef.current.height / 2) + (Math.random() - 0.5) * 300
-        node.vx = (Math.random() - 0.5) * 2
-        node.vy = (Math.random() - 0.5) * 2
-      }
-      layoutRef.current.start(() => render())
-    }
-  }
+  const cursor = panningRef.current || draggingRef.current ? 'grabbing' : 'grab'
 
   return (
-    <div ref={containerRef} style={{ position: 'relative', width: '100%', height: '100%', minHeight: 500 }}>
+    <div
+      ref={containerRef}
+      style={{ position: 'relative', width: '100%', height: '100%', minHeight: 500 }}
+    >
       <canvas
         ref={canvasRef}
         style={{
           width: '100%',
           height: '100%',
-          cursor: panningRef.current ? 'grabbing' : draggingRef.current ? 'grabbing' : 'grab',
+          cursor,
           background: '#f8fafc',
           borderRadius: 12
         }}
@@ -377,26 +279,15 @@ export default function TopologyGraph({
         onWheel={handleWheel}
       />
 
-      <div style={{
-        position: 'absolute', top: 16, right: 16, display: 'flex', flexDirection: 'column', gap: 6, zIndex: 10
-      }}>
-        <ZoomBtn onClick={zoomIn}>＋</ZoomBtn>
-        <ZoomBtn onClick={zoomOut}>－</ZoomBtn>
-        <ZoomBtn onClick={resetView} title="重置视图">⌂</ZoomBtn>
-        <ZoomBtn onClick={relayout} title="重新布局">↻</ZoomBtn>
-      </div>
+      <TopologyControls
+        onZoomIn={zoomIn}
+        onZoomOut={zoomOut}
+        onResetView={resetView}
+        onRelayout={relayout}
+        position="top-right"
+      />
 
-      <div style={{
-        position: 'absolute', bottom: 16, left: 16, display: 'flex', gap: 16,
-        background: 'rgba(255,255,255,0.9)', padding: '10px 14px', borderRadius: 10,
-        fontSize: 12, border: '1px solid #e5e7eb', zIndex: 10, flexWrap: 'wrap'
-      }}>
-        <LegendItem color="#ef4444" label="故障节点" />
-        <LegendItem color="#f97316" label="直接影响" />
-        <LegendItem color="#fbbf24" label="间接影响" />
-        <LegendItem color="#10b981" label="正常运行" />
-        <LegendItem color="#f59e0b" label="维护中" />
-      </div>
+      <TopologyLegend position="bottom-left" />
 
       {tooltip && (
         <div style={{
@@ -449,45 +340,110 @@ export default function TopologyGraph({
   )
 }
 
-function ZoomBtn({ children, onClick, title }) {
-  return (
-    <button
-      onClick={onClick}
-      title={title}
-      style={{
-        width: 36, height: 36, borderRadius: 8,
-        background: '#fff', border: '1px solid #e5e7eb',
-        cursor: 'pointer', fontSize: 16, fontWeight: 600,
-        color: '#4b5563', boxShadow: '0 1px 3px rgba(0,0,0,0.08)',
-        display: 'flex', alignItems: 'center', justifyContent: 'center'
-      }}
-      onMouseEnter={e => { e.currentTarget.style.background = '#f3f4f6' }}
-      onMouseLeave={e => { e.currentTarget.style.background = '#fff' }}
-    >{children}</button>
+function drawEdge(ctx, source, target, { isHighlighted, isHovered }) {
+  ctx.save()
+  ctx.strokeStyle = isHovered ? '#6366f1' : isHighlighted ? '#818cf8' : '#cbd5e1'
+  ctx.lineWidth = isHovered ? 3 : isHighlighted ? 2.5 : 1.5
+
+  const dx = target.x - source.x
+  const dy = target.y - source.y
+  const dist = Math.sqrt(dx * dx + dy * dy) || 1
+  const ux = dx / dist
+  const uy = dy / dist
+
+  const sx = source.x + ux * source.radius
+  const sy = source.y + uy * source.radius
+  const ex = target.x - ux * (target.radius + 10)
+  const ey = target.y - uy * (target.radius + 10)
+
+  ctx.beginPath()
+  ctx.moveTo(sx, sy)
+  ctx.lineTo(ex, ey)
+  ctx.stroke()
+
+  const arrowSize = isHovered ? 12 : 8
+  const ahx = ux * arrowSize
+  const ahy = uy * arrowSize
+  const apx = -uy * arrowSize * 0.5
+  const apy = ux * arrowSize * 0.5
+
+  ctx.fillStyle = ctx.strokeStyle
+  ctx.beginPath()
+  ctx.moveTo(ex, ey)
+  ctx.lineTo(ex - ahx + apx, ey - ahy + apy)
+  ctx.lineTo(ex - ahx - apx, ey - ahy - apy)
+  ctx.closePath()
+  ctx.fill()
+  ctx.restore()
+}
+
+function drawNode(ctx, node, { color, isSelected, isHovered, isFailed, isDirect, isIndirect }) {
+  ctx.save()
+
+  if (isFailed || isDirect || isIndirect) {
+    const pulseRadius = node.radius + (isFailed ? 20 : isDirect ? 15 : 10)
+    const gradient = ctx.createRadialGradient(node.x, node.y, node.radius, node.x, node.y, pulseRadius)
+    const colorMap = {
+      failed: 'rgba(239,68,68,0.4)',
+      direct: 'rgba(249,115,22,0.3)',
+      indirect: 'rgba(251,191,36,0.25)'
+    }
+    const key = isFailed ? 'failed' : isDirect ? 'direct' : 'indirect'
+    gradient.addColorStop(0, colorMap[key])
+    gradient.addColorStop(1, 'rgba(0,0,0,0)')
+    ctx.fillStyle = gradient
+    ctx.beginPath()
+    ctx.arc(node.x, node.y, pulseRadius, 0, Math.PI * 2)
+    ctx.fill()
+  }
+
+  if (isSelected || isHovered) {
+    ctx.strokeStyle = isSelected ? '#6366f1' : '#94a3b8'
+    ctx.lineWidth = isSelected ? 4 : 2
+    ctx.beginPath()
+    ctx.arc(node.x, node.y, node.radius + (isSelected ? 6 : 3), 0, Math.PI * 2)
+    ctx.stroke()
+  }
+
+  const gradient = ctx.createRadialGradient(
+    node.x - node.radius * 0.3, node.y - node.radius * 0.3, 0,
+    node.x, node.y, node.radius
   )
-}
+  gradient.addColorStop(0, lightenColor(color, 40))
+  gradient.addColorStop(1, color)
 
-function LegendItem({ color, label }) {
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-      <span style={{ width: 10, height: 10, borderRadius: '50%', background: color }} />
-      <span style={{ color: '#4b5563' }}>{label}</span>
-    </div>
-  )
-}
+  ctx.fillStyle = gradient
+  ctx.beginPath()
+  ctx.arc(node.x, node.y, node.radius, 0, Math.PI * 2)
+  ctx.fill()
 
-function lightenColor(hex, percent) {
-  const num = parseInt(hex.replace('#', ''), 16)
-  const r = Math.min(255, (num >> 16) + Math.round(255 * percent / 100))
-  const g = Math.min(255, ((num >> 8) & 0x00FF) + Math.round(255 * percent / 100))
-  const b = Math.min(255, (num & 0x0000FF) + Math.round(255 * percent / 100))
-  return `#${((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1)}`
-}
+  ctx.strokeStyle = darkenColor(color, 20)
+  ctx.lineWidth = 2
+  ctx.stroke()
 
-function darkenColor(hex, percent) {
-  const num = parseInt(hex.replace('#', ''), 16)
-  const r = Math.max(0, (num >> 16) - Math.round(255 * percent / 100))
-  const g = Math.max(0, ((num >> 8) & 0x00FF) - Math.round(255 * percent / 100))
-  const b = Math.max(0, (num & 0x0000FF) - Math.round(255 * percent / 100))
-  return `#${((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1)}`
+  ctx.fillStyle = '#fff'
+  ctx.font = 'bold 20px sans-serif'
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  const icon = TYPE_ICONS[node.service?.type] || '📦'
+  ctx.fillText(icon, node.x, node.y - 2)
+
+  ctx.fillStyle = '#1f2937'
+  ctx.font = '12px sans-serif'
+  const name = node.name || `Service ${node.id}`
+  const displayName = name.length > 14 ? name.substring(0, 12) + '...' : name
+  ctx.fillText(displayName, node.x, node.y + node.radius + 16)
+
+  const status = node.service?.summary?.status
+  if (status === 'down') {
+    ctx.fillStyle = '#ef4444'
+    ctx.font = 'bold 10px sans-serif'
+    ctx.fillText('故障', node.x, node.y + node.radius + 30)
+  } else if (status === 'maintenance') {
+    ctx.fillStyle = '#f59e0b'
+    ctx.font = 'bold 10px sans-serif'
+    ctx.fillText('维护中', node.x, node.y + node.radius + 30)
+  }
+
+  ctx.restore()
 }

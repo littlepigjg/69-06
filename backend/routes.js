@@ -389,10 +389,14 @@ router.post('/topology/dependencies/batch', async (req, res) => {
     if (!Array.isArray(items)) {
       return res.status(400).json({ error: 'items must be an array' });
     }
+    if (!['merge', 'replace'].includes(mode)) {
+      return res.status(400).json({ error: 'mode must be "merge" or "replace"' });
+    }
 
     const allDeps = await storage.dependencies.getAll();
     const validItems = [];
     const skipped = [];
+    const baseDeps = mode === 'replace' ? [] : allDeps;
 
     for (const item of items) {
       const upId = parseInt(item.upstream_id, 10);
@@ -401,7 +405,7 @@ router.post('/topology/dependencies/batch', async (req, res) => {
         skipped.push({ ...item, reason: 'invalid_ids' });
         continue;
       }
-      if (topology.wouldCreateCycle([...allDeps, ...validItems], upId, downId)) {
+      if (topology.wouldCreateCycle([...baseDeps, ...validItems], upId, downId)) {
         skipped.push({ ...item, reason: 'would_create_cycle' });
         continue;
       }
@@ -412,13 +416,62 @@ router.post('/topology/dependencies/batch', async (req, res) => {
       });
     }
 
+    let finalDeps;
     if (mode === 'replace') {
+      finalDeps = validItems;
+    } else {
+      const existingPairs = new Set(allDeps.map(d => `${d.upstream_id}:${d.downstream_id}`));
+      const newItems = validItems.filter(v => !existingPairs.has(`${v.upstream_id}:${v.downstream_id}`));
+      finalDeps = [...allDeps, ...newItems];
+    }
+
+    const cycles = topology.detectCycles(finalDeps);
+    if (cycles.length > 0) {
+      return res.status(400).json({
+        error: 'Import would create circular dependencies',
+        cycle: true,
+        cycles,
+        skipped,
+        total: items.length
+      });
+    }
+
+    let backupDeps = null;
+    if (mode === 'replace') {
+      backupDeps = allDeps;
       await storage.dependencies.clearAll();
     }
 
-    const imported = await storage.dependencies.bulkImport(validItems);
-    notifier.notifyTopologyChange('batch_import', { count: imported.length, mode });
-    res.json({ imported: imported.length, skipped, total: imported.length + skipped.length });
+    try {
+      const imported = await storage.dependencies.bulkImport(validItems);
+      const verifyDeps = await storage.dependencies.getAll();
+      const verifyCycles = topology.detectCycles(verifyDeps);
+      if (verifyCycles.length > 0) {
+        if (mode === 'replace' && backupDeps) {
+          await storage.dependencies.clearAll();
+          await storage.dependencies.bulkImport(backupDeps);
+        } else {
+          for (const item of validItems) {
+            await storage.dependencies.removeByPair(item.upstream_id, item.downstream_id);
+          }
+        }
+        return res.status(400).json({
+          error: 'Circular dependency detected during verification, import rolled back',
+          cycle: true,
+          cycles: verifyCycles,
+          skipped,
+          total: items.length
+        });
+      }
+      notifier.notifyTopologyChange('batch_import', { count: imported.length, mode });
+      res.json({ imported: imported.length, skipped, total: imported.length + skipped.length });
+    } catch (importErr) {
+      if (mode === 'replace' && backupDeps) {
+        await storage.dependencies.clearAll();
+        await storage.dependencies.bulkImport(backupDeps);
+      }
+      throw importErr;
+    }
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });

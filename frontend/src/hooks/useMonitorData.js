@@ -81,8 +81,19 @@ export default function useMonitorData({ onMessage } = {}) {
     maxReconnectDelay: 10000
   })
 
+  const refreshAll = useCallback(() => {
+    fetchServices()
+    fetchMaintenance()
+    fetchDependencies()
+    fetchTopologyStats()
+  }, [fetchServices, fetchMaintenance, fetchDependencies, fetchTopologyStats])
+
   useEffect(() => {
     const unsub = ws.subscribe((event) => {
+      if (event.type === 'open') {
+        refreshAll()
+        return
+      }
       if (event.type !== 'message') return
       const msg = event.data
 
@@ -110,7 +121,7 @@ export default function useMonitorData({ onMessage } = {}) {
       }
     })
     return unsub
-  }, [ws, fetchServices, fetchMaintenance, fetchDependencies, fetchTopologyStats])
+  }, [ws, fetchServices, fetchMaintenance, fetchDependencies, fetchTopologyStats, refreshAll])
 
   useEffect(() => {
     fetchFullTopology()
