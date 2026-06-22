@@ -129,6 +129,7 @@ export class ForceLayout {
     this._rafId = null
     this.pinnedIds = new Set()
     this.savedPositions = new Map()
+    this.autoFreezeOnStable = options.autoFreezeOnStable !== false
   }
 
   setSize(width, height) {
@@ -170,27 +171,27 @@ export class ForceLayout {
     }
   }
 
-  _getCentroid() {
-    const nodeList = [...this.nodes.values()]
-    if (nodeList.length === 0) return { x: this.width / 2, y: this.height / 2 }
+  _getCentroid(nodeList) {
+    const nodes = nodeList || [...this.nodes.values()]
+    if (nodes.length === 0) return { x: this.width / 2, y: this.height / 2 }
     let sumX = 0, sumY = 0
-    for (const n of nodeList) {
+    for (const n of nodes) {
       sumX += n.x
       sumY += n.y
     }
-    return { x: sumX / nodeList.length, y: sumY / nodeList.length }
+    return { x: sumX / nodes.length, y: sumY / nodes.length }
   }
 
-  _getSpread() {
-    const nodeList = [...this.nodes.values()]
-    if (nodeList.length === 0) return { radius: 100 }
-    const c = this._getCentroid()
-    let maxDist = 100
-    for (const n of nodeList) {
+  _getSpread(nodeList) {
+    const nodes = nodeList || [...this.nodes.values()]
+    if (nodes.length === 0) return { centroid: { x: this.width / 2, y: this.height / 2 }, radius: 100 }
+    const c = this._getCentroid(nodes)
+    let maxDist = 0
+    for (const n of nodes) {
       const d = Math.sqrt((n.x - c.x) ** 2 + (n.y - c.y) ** 2)
       if (d > maxDist) maxDist = d
     }
-    return { centroid: c, radius: maxDist }
+    return { centroid: c, radius: Math.max(maxDist, 30) }
   }
 
   setData(services, dependencies) {
@@ -198,8 +199,15 @@ export class ForceLayout {
     const existingPinned = new Set(this.pinnedIds)
     const prevCount = existingNodes.size
 
+    const prevNodeList = [...existingNodes.values()]
+    const prevSpread = this._getSpread(prevNodeList)
+
     this.nodes.clear()
     this.edges = []
+
+    const newIds = new Set(services.map(s => s.id))
+    const newNodeCount = services.filter(s => !existingNodes.has(s.id)).length
+    const hasNewNodes = newNodeCount > 0
 
     for (const svc of services) {
       const existing = existingNodes.get(svc.id)
@@ -214,7 +222,7 @@ export class ForceLayout {
         x = saved.x
         y = saved.y
       } else if (prevCount > 0) {
-        const { centroid, radius } = this._getSpread()
+        const { centroid, radius } = prevSpread
         const angle = Math.random() * Math.PI * 2
         const dist = radius + 80 + Math.random() * 60
         x = centroid.x + Math.cos(angle) * dist
@@ -224,22 +232,30 @@ export class ForceLayout {
         y = this.height / 2 + (Math.random() - 0.5) * 200
       }
 
+      const shouldPinExisting = this.autoFreezeOnStable && hasNewNodes && existing && !isPinned
+      const finalPinned = isPinned || shouldPinExisting
+
       const node = {
         id: svc.id,
         name: svc.name,
         x,
         y,
-        vx: existing?.vx ?? 0,
-        vy: existing?.vy ?? 0,
-        fx: isPinned ? x : null,
-        fy: isPinned ? y : null,
+        vx: (existing && !hasNewNodes) ? existing.vx : 0,
+        vy: (existing && !hasNewNodes) ? existing.vy : 0,
+        fx: finalPinned ? x : null,
+        fy: finalPinned ? y : null,
         service: svc,
-        radius: 30
+        radius: 30,
+        isNew: !existing && !saved
       }
       this.nodes.set(svc.id, node)
     }
 
-    this.pinnedIds = new Set([...existingPinned].filter(id => this.nodes.has(id)))
+    const keptPinned = [...existingPinned].filter(id => newIds.has(id))
+    const newlyFrozen = hasNewNodes && this.autoFreezeOnStable
+      ? [...existingNodes.keys()].filter(id => newIds.has(id) && !existingPinned.has(id))
+      : []
+    this.pinnedIds = new Set([...keptPinned, ...newlyFrozen])
 
     for (const dep of dependencies) {
       if (this.nodes.has(dep.upstream_id) && this.nodes.has(dep.downstream_id)) {
@@ -249,6 +265,42 @@ export class ForceLayout {
           target: dep.downstream_id,
           dep
         })
+      }
+    }
+  }
+
+  freezeAll() {
+    for (const node of this.nodes.values()) {
+      node.fx = node.x
+      node.fy = node.y
+      node.vx = 0
+      node.vy = 0
+      this.pinnedIds.add(node.id)
+    }
+  }
+
+  unfreezeAll() {
+    for (const node of this.nodes.values()) {
+      node.fx = null
+      node.fy = null
+    }
+    this.pinnedIds.clear()
+  }
+
+  getNewNodeIds() {
+    const result = []
+    for (const node of this.nodes.values()) {
+      if (node.isNew) result.push(node.id)
+    }
+    return result
+  }
+
+  unfreezeNewNodes() {
+    for (const node of this.nodes.values()) {
+      if (node.isNew) {
+        node.fx = null
+        node.fy = null
+        this.pinnedIds.delete(node.id)
       }
     }
   }

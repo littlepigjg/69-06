@@ -24,6 +24,7 @@ export default function TopologyGraph({
   const draggingRef = useRef(null)
   const panningRef = useRef(null)
   const renderTickRef = useRef(0)
+  const [isFrozen, setIsFrozen] = useState(false)
 
   const failedIds = useMemo(() =>
     services.filter(s => s.summary?.status === 'down').map(s => s.id),
@@ -59,7 +60,10 @@ export default function TopologyGraph({
     getNodeAt,
     getEdgeAt,
     reset,
-    scheduleSave
+    relayout,
+    scheduleSave,
+    freezeAll,
+    unfreezeAll
   } = useForceLayout({
     services,
     dependencies,
@@ -252,9 +256,24 @@ export default function TopologyGraph({
     transformRef.current = { x: 0, y: 0, scale: 1 }
   }, [])
 
-  const relayout = useCallback(() => {
+  const handleRelayout = useCallback(() => {
+    relayout()
+  }, [relayout])
+
+  const handleReset = useCallback(() => {
     reset()
+    setIsFrozen(false)
   }, [reset])
+
+  const handleFreeze = useCallback(() => {
+    freezeAll()
+    setIsFrozen(true)
+  }, [freezeAll])
+
+  const handleUnfreeze = useCallback(() => {
+    unfreezeAll()
+    setIsFrozen(false)
+  }, [unfreezeAll])
 
   const cursor = panningRef.current || draggingRef.current ? 'grabbing' : 'grab'
 
@@ -283,7 +302,11 @@ export default function TopologyGraph({
         onZoomIn={zoomIn}
         onZoomOut={zoomOut}
         onResetView={resetView}
-        onRelayout={relayout}
+        onRelayout={handleRelayout}
+        onReset={handleReset}
+        onFreeze={handleFreeze}
+        onUnfreeze={handleUnfreeze}
+        isFrozen={isFrozen}
         position="top-right"
       />
 

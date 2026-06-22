@@ -5,6 +5,10 @@ export default function TopologyControls({
   onZoomOut,
   onResetView,
   onRelayout,
+  onReset,
+  onFreeze,
+  onUnfreeze,
+  isFrozen = false,
   position = 'top-right'
 }) {
   const positionStyles = {
@@ -27,6 +31,15 @@ export default function TopologyControls({
       <ControlButton onClick={onZoomOut} title="缩小">－</ControlButton>
       <ControlButton onClick={onResetView} title="重置视图">⌂</ControlButton>
       <ControlButton onClick={onRelayout} title="重新布局">↻</ControlButton>
+      {onReset && <ControlButton onClick={onReset} title="重置所有位置">⟲</ControlButton>}
+      {onFreeze && onUnfreeze && (
+        <ControlButton
+          onClick={isFrozen ? onUnfreeze : onFreeze}
+          title={isFrozen ? '解锁布局' : '锁定布局'}
+        >
+          {isFrozen ? '🔓' : '🔒'}
+        </ControlButton>
+      )}
     </div>
   )
 }

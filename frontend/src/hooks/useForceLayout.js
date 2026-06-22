@@ -13,6 +13,8 @@ export default function useForceLayout({
   const layoutRef = useRef(null)
   const [isStable, setIsStable] = useState(false)
   const stableCheckRef = useRef(null)
+  const animFrameRef = useRef(null)
+  const prevServicesRef = useRef([])
 
   const getLayout = useCallback(() => {
     if (!layoutRef.current && width && height) {
@@ -54,7 +56,8 @@ export default function useForceLayout({
   const start = useCallback(() => {
     const layout = getLayout()
     if (!layout) return
-    layout.stop()
+    if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current)
+
     let stableFrames = 0
     const tick = () => {
       if (!layoutRef.current) return
@@ -63,21 +66,33 @@ export default function useForceLayout({
 
       if (maxV < layout.minVelocity * 2) {
         stableFrames += 1
-        if (stableFrames > 10) {
+        if (stableFrames > 15) {
           setIsStable(true)
+          if (layout.autoFreezeOnStable) {
+            for (const node of layout.nodes.values()) {
+              if (!node.isNew) {
+                layout.fixNode(node.id, node.x, node.y)
+              }
+            }
+          }
           scheduleSave()
+          animFrameRef.current = null
           return
         }
       } else {
         stableFrames = 0
         setIsStable(false)
       }
-      requestAnimationFrame(tick)
+      animFrameRef.current = requestAnimationFrame(tick)
     }
-    requestAnimationFrame(tick)
+    animFrameRef.current = requestAnimationFrame(tick)
   }, [getLayout, onTick, scheduleSave])
 
   const stop = useCallback(() => {
+    if (animFrameRef.current) {
+      cancelAnimationFrame(animFrameRef.current)
+      animFrameRef.current = null
+    }
     layoutRef.current?.stop()
   }, [])
 
@@ -87,9 +102,7 @@ export default function useForceLayout({
     try {
       if (storageKey) localStorage.removeItem(storageKey)
     } catch (e) {}
-    for (const node of layout.nodes.values()) {
-      layout.releaseNode(node.id)
-    }
+    layout.unfreezeAll()
     const w = layout.width
     const h = layout.height
     for (const node of layout.nodes.values()) {
@@ -97,9 +110,22 @@ export default function useForceLayout({
       node.y = h / 2 + (Math.random() - 0.5) * 300
       node.vx = (Math.random() - 0.5) * 2
       node.vy = (Math.random() - 0.5) * 2
+      node.isNew = false
     }
     start()
   }, [getLayout, storageKey, start])
+
+  const relayout = useCallback(() => {
+    const layout = getLayout()
+    if (!layout) return
+    layout.unfreezeAll()
+    for (const node of layout.nodes.values()) {
+      node.vx = (Math.random() - 0.5) * 4
+      node.vy = (Math.random() - 0.5) * 4
+      node.isNew = false
+    }
+    start()
+  }, [getLayout, start])
 
   const setSize = useCallback((w, h) => {
     layoutRef.current?.setSize(w, h)
@@ -110,7 +136,11 @@ export default function useForceLayout({
   }, [])
 
   const releaseNode = useCallback((id) => {
-    layoutRef.current?.releaseNode(id)
+    const layout = layoutRef.current
+    if (!layout) return
+    layout.releaseNode(id)
+    const node = layout.nodes.get(id)
+    if (node) node.isNew = false
   }, [])
 
   const getNodeAt = useCallback((x, y) => {
@@ -126,23 +156,47 @@ export default function useForceLayout({
     return node ? { x: node.x, y: node.y } : null
   }, [])
 
+  const freezeAll = useCallback(() => {
+    layoutRef.current?.freezeAll()
+    scheduleSave()
+  }, [scheduleSave])
+
+  const unfreezeAll = useCallback(() => {
+    const layout = layoutRef.current
+    if (!layout) return
+    layout.unfreezeAll()
+    for (const node of layout.nodes.values()) {
+      node.isNew = false
+    }
+    start()
+  }, [start])
+
   useEffect(() => {
     const layout = getLayout()
     if (!layout) return
+
+    const prevIds = new Set(prevServicesRef.current.map(s => s.id))
+    const currIds = new Set(services.map(s => s.id))
+    const hasNew = services.some(s => !prevIds.has(s.id))
+    const hasRemoved = prevServicesRef.current.some(s => !currIds.has(s.id))
 
     if (storageKey) {
       const saved = loadPositions()
       if (saved?.positions) {
         layout.setSavedPositions(saved.positions)
       }
+      if (saved?.pinned && saved.pinned.length > 0 && !hasNew && !hasRemoved) {
+        layout.setPinnedIds(saved.pinned)
+      }
     }
 
     layout.setData(services, dependencies)
+    prevServicesRef.current = services
 
-    if (storageKey) {
-      const saved = loadPositions()
-      if (saved?.pinned && saved.pinned.length > 0) {
-        layout.setPinnedIds(saved.pinned)
+    if (hasNew) {
+      const newIds = layout.getNewNodeIds()
+      for (const id of newIds) {
+        layout.releaseNode(id)
       }
     }
 
@@ -167,6 +221,7 @@ export default function useForceLayout({
     start,
     stop,
     reset,
+    relayout,
     setSize,
     fixNode,
     releaseNode,
@@ -175,6 +230,8 @@ export default function useForceLayout({
     getNodePosition,
     savePositions,
     scheduleSave,
+    freezeAll,
+    unfreezeAll,
     nodes: layoutRef.current?.nodes || new Map(),
     edges: layoutRef.current?.edges || []
   }
